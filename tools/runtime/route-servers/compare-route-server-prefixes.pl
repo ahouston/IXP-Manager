@@ -52,7 +52,7 @@ my $debug = 1;
 my $do_nothing = 0;
 
 # XXX-SET-ME
-my $vlanid = "1";
+my $vlanid = "5";
 
 my $ixpconfig = new IXPManager::Config;
 my $dbh = $ixpconfig->{db};
@@ -107,16 +107,18 @@ while (my $rec = $sth->fetchrow_hashref) {
 
 foreach my $protocol (qw(4 6)) {
 	# XXX-SET-ME
-	my $conffile = "/etc/bird/bird-vlanid".$vlanid."-ipv".$protocol.".conf";
-	my $sockfile = "/var/run/bird/bird-vlanid".$vlanid."-ipv".$protocol.".ctl";
+	my $conffile = "/etc/bird/bird".$protocol.".conf";
+	my $sockfile = "/run/bird/bird".$protocol.".ctl";
 
 	open (INPUT, $conffile);
 	my ($asn, $address, $prefixes);
 
 	while (<INPUT>) {
-		if (/^\s*allnet\s*=\s*\[\s*([a-fA-F0-9\.:,\s\/]+)\s*\]/) {
+		if (/^\s*allnet\s*=\s*\[\s*([a-fA-F0-9\{\}\.:,\s\/]+)\s*\]/) {
 			$prefixes = $1;
 			$prefixes =~ s/^\s+|\s+$//g;
+			# Do this later when iterating the loop
+			#$prefixes =~ s/{[^}]*}//g;
 			next;
 		} elsif (/^\s*neighbor\s+([a-fA-F0-9\.:]+)\s+as\s+(\d+)/) {
 			$address = $1; $asn = $2;
@@ -125,11 +127,35 @@ foreach my $protocol (qw(4 6)) {
 		}
 
 		my @pfxlist = split(/\s*,\s*/, $prefixes);
-		foreach my $prefix (@pfxlist) {
+		foreach my $prefix_line (@pfxlist) {
+			
+			# Lets parse out the prefix that looks like this: 128.161.0.0/16{16,24}
+			# We use a question mark on the second match so that it'll match either 128.161.0.0/16{16,24} or 128.161.0.0/16
+			(my $prefix, my $range) = $prefix_line =~/(\d+\.\d+\.\d+\.\d+\/\d+)({\d+,\d+})?/ ? ($1,$2) : (undef,undef);
+			if (!$prefix && $debug) { print "DEBUG: Error parsing prefix: $prefix\n"; next; }
+			# Now lets match the values in the range if it's there
+			(my $range_min, my $range_max) = $range =~/{(\d+),(\d+)}/ ? ($1,$2) : (undef,undef);
+			
 			my $ip = new NetAddr::IP::Lite $prefix;
 			next unless $ip;
 			my $p = \%{$origin->{$protocol}->{$asn}->{$ip->short."/".$ip->masklen}};
 			$p->{refresh_irrdb} = 1;
+			# Lets store whether its in the range if one is spacified
+			# Here is the one liner to do this
+			# $p->{in_range} = !($range_min && $range_max) ? 1 : ($range_min && $range_max) && $ip->masklen >= $range_min && $ip->masklen <= $range_max ? 1 : 0;
+			# ...or in more readable perl...
+			
+			if (!($range_min && $range_max)) { 
+				$p->{in_range} = 1; 	# No range was specified, so we consider it to be in range
+			}
+			elsif (($range_min && $range_max) && $ip->masklen >= $range_min && $ip->masklen <= $range_max) {
+				$p->{in_range} = 1; 	# A range was specified, and the masklen was in it
+			}
+			else {
+				$p->{in_range} = 0;		# The mask len was out of range!
+				print "DEBUG: $prefix failed to match given range: $range\n" if ($debug);
+			}
+			
 			if (!defined ($p->{irrdb}) || (defined ($p->{irrdb}) && $p->{irrdb} != 1)) {
 				$p->{irrdb} = 1;
 				$p->{changed} = 1;
@@ -176,7 +202,7 @@ foreach my $protocol (qw(4 6)) {
 		foreach my $prefix (keys %{$origin->{$protocol}->{$asn}}) {
 			my $p = \%{$origin->{$protocol}->{$asn}->{$prefix}};
 
-			if ($p->{changed}) {
+			if ($p->{changed} && $p->{in_range}) {
 				if (!defined ($p->{id})) {			# new entry
 					my $irrdb = defined ($p->{irrdb}) ? 1 : 0;
 					my $rs_origin = defined ($p->{rs_origin}) ? $p->{rs_origin} : "";
@@ -201,3 +227,4 @@ foreach my $protocol (qw(4 6)) {
 
 	$do_nothing or $dbh->do('COMMIT') or die $dbh->errstr;
 }
+
